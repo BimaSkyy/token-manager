@@ -17,8 +17,9 @@ except ImportError:
 
 app = Flask(__name__)
 
-KV_URL   = os.environ.get("KV_REST_API_URL", "")
-KV_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
+# Vercel marketplace Upstash otomatis set env var ini
+KV_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+KV_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 SECRET   = os.environ.get("STORE_SECRET", "")  # shared secret antara Koyeb & Vercel
 
 TOKEN_KEY = "yt_token"
