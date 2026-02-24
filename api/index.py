@@ -1,13 +1,21 @@
 """
 YouTube Token Store — Vercel
 Fungsi: hanya simpan & ambil token. Semua logic ada di Koyeb.
-Pakai REDIS_URL standar.
 """
 
 import os
 import json
+import subprocess
+import sys
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
+
+# Auto-install redis jika belum ada
+try:
+    import redis
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "redis==5.0.1"], check=True)
+    import redis
 
 app = Flask(__name__)
 
@@ -22,7 +30,6 @@ TOKEN_KEY = "yt_token"
 def get_redis():
     if not REDIS_URL: return None
     try:
-        import redis
         return redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=10)
     except Exception as e:
         print(f"[REDIS] Connect error: {e}")
@@ -119,18 +126,20 @@ def status():
 @app.route("/api/health", methods=["GET"])
 def health():
     redis_ok = False
+    error_msg = None
     try:
         r = get_redis()
         if r:
             r.ping()
             redis_ok = True
-    except Exception:
-        pass
+    except Exception as e:
+        error_msg = str(e)
     return jsonify({
         "ok": True,
         "redis_connected": redis_ok,
         "redis_url_set": bool(REDIS_URL),
         "secret_configured": bool(SECRET),
+        "error": error_msg,
         "time": datetime.now(timezone.utc).isoformat()
     })
 
