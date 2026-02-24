@@ -1,6 +1,7 @@
 """
 YouTube Token Store — Vercel
 Fungsi: hanya simpan & ambil token. Semua logic ada di Koyeb.
+Pakai REDIS_URL standar.
 """
 
 import os
@@ -8,54 +9,42 @@ import json
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
-# ── Vercel KV via REST API ────────────────────────────────────
-try:
-    import requests as req_lib
-    REQUESTS_OK = True
-except ImportError:
-    REQUESTS_OK = False
-
 app = Flask(__name__)
 
-# Vercel marketplace Upstash otomatis set env var ini
-KV_URL   = os.environ.get("UPSTASH_REDIS_REST_URL", "")
-KV_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
-SECRET   = os.environ.get("STORE_SECRET", "")  # shared secret antara Koyeb & Vercel
-
+REDIS_URL = os.environ.get("REDIS_URL", "")
+SECRET    = os.environ.get("STORE_SECRET", "")
 TOKEN_KEY = "yt_token"
 
 # ─────────────────────────────────────────────────────────────
-# KV Helpers (pakai Upstash REST API langsung, tanpa library)
+# Redis Helpers
 # ─────────────────────────────────────────────────────────────
 
-def kv_set(key: str, value: str) -> bool:
-    if not REQUESTS_OK or not KV_URL: return False
+def get_redis():
+    if not REDIS_URL: return None
     try:
-        r = req_lib.post(
-            f"{KV_URL}/set/{key}",
-            headers={"Authorization": f"Bearer {KV_TOKEN}"},
-            json=value,
-            timeout=10
-        )
-        return r.status_code == 200
+        import redis
+        return redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=10)
     except Exception as e:
-        print(f"[KV SET] error: {e}")
+        print(f"[REDIS] Connect error: {e}")
+        return None
+
+def kv_set(key: str, value: str) -> bool:
+    r = get_redis()
+    if not r: return False
+    try:
+        r.set(key, value)
+        return True
+    except Exception as e:
+        print(f"[REDIS SET] error: {e}")
         return False
 
 def kv_get(key: str):
-    if not REQUESTS_OK or not KV_URL: return None
+    r = get_redis()
+    if not r: return None
     try:
-        r = req_lib.get(
-            f"{KV_URL}/get/{key}",
-            headers={"Authorization": f"Bearer {KV_TOKEN}"},
-            timeout=10
-        )
-        if r.status_code == 200:
-            result = r.json().get("result")
-            return result
-        return None
+        return r.get(key)
     except Exception as e:
-        print(f"[KV GET] error: {e}")
+        print(f"[REDIS GET] error: {e}")
         return None
 
 # ─────────────────────────────────────────────────────────────
@@ -75,11 +64,10 @@ def auth_ok() -> bool:
 
 @app.route("/api/save-token", methods=["POST"])
 def save_token():
-    """Koyeb kirim token ke sini untuk disimpan."""
     if not auth_ok():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-    data = request.get_json(silent=True) or {}
+    data  = request.get_json(silent=True) or {}
     token = data.get("token")
     if not token:
         return jsonify({"ok": False, "error": "Field 'token' tidak ada"}), 400
@@ -93,12 +81,11 @@ def save_token():
     if ok:
         return jsonify({"ok": True, "saved_at": payload["saved_at"]})
     else:
-        return jsonify({"ok": False, "error": "Gagal simpan ke KV"}), 500
+        return jsonify({"ok": False, "error": "Gagal simpan ke Redis"}), 500
 
 
 @app.route("/api/get-token", methods=["GET"])
 def get_token():
-    """Koyeb ambil token dari sini."""
     if not auth_ok():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
@@ -119,25 +106,30 @@ def get_token():
 
 @app.route("/api/status", methods=["GET"])
 def status():
-    """Cek apakah token ada (tidak perlu secret, info minimal)."""
     raw = kv_get(TOKEN_KEY)
     if not raw:
         return jsonify({"token_exists": False, "saved_at": None})
     try:
         payload = json.loads(raw) if isinstance(raw, str) else raw
-        return jsonify({
-            "token_exists": True,
-            "saved_at": payload.get("saved_at")
-        })
+        return jsonify({"token_exists": True, "saved_at": payload.get("saved_at")})
     except Exception:
         return jsonify({"token_exists": False, "saved_at": None})
 
 
 @app.route("/api/health", methods=["GET"])
 def health():
+    redis_ok = False
+    try:
+        r = get_redis()
+        if r:
+            r.ping()
+            redis_ok = True
+    except Exception:
+        pass
     return jsonify({
         "ok": True,
-        "kv_configured": bool(KV_URL and KV_TOKEN),
+        "redis_connected": redis_ok,
+        "redis_url_set": bool(REDIS_URL),
         "secret_configured": bool(SECRET),
         "time": datetime.now(timezone.utc).isoformat()
     })
@@ -186,7 +178,7 @@ def index():
 <body>
 <div class="card">
   <h1>🔐 YT Token Store</h1>
-  <p class="sub">Token disimpan di Vercel KV — dikelola oleh Koyeb</p>
+  <p class="sub">Token disimpan di Redis — dikelola oleh Koyeb</p>
   <div class="badge">{status_text}</div>
   <div class="meta">Terakhir disimpan: {saved_at}</div>
   <div class="endpoints">
