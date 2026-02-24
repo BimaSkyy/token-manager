@@ -1,7 +1,6 @@
 """
 YouTube Token Store — Vercel
-Pakai requests (built-in) untuk konek Redis Cloud via REST API.
-Tidak butuh library redis sama sekali.
+Pakai JSONBin.io untuk simpan token. Gratis, no library, cukup requests.
 """
 
 import os
@@ -12,120 +11,46 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-REDIS_URL = os.environ.get("REDIS_URL", "")
-SECRET    = os.environ.get("STORE_SECRET", "")
-TOKEN_KEY = "yt_token"
+# JSONBin.io config — set di env var Vercel
+JSONBIN_BIN_ID  = os.environ.get("JSONBIN_BIN_ID", "")   # ID bin dari JSONBin
+JSONBIN_API_KEY = os.environ.get("JSONBIN_API_KEY", "")   # Master key dari JSONBin
+SECRET          = os.environ.get("STORE_SECRET", "")
+
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 
 # ─────────────────────────────────────────────────────────────
-# Parse REDIS_URL → host, port, password
-# Format: redis://default:PASSWORD@HOST:PORT
+# JSONBin Helpers
 # ─────────────────────────────────────────────────────────────
 
-def parse_redis_url(url):
-    try:
-        # rediss:// atau redis://
-        url = url.replace("rediss://", "").replace("redis://", "")
-        # pisah auth dan host
-        if "@" in url:
-            auth, hostport = url.rsplit("@", 1)
-        else:
-            auth, hostport = "", url
-        # pisah user:pass
-        if ":" in auth:
-            _, password = auth.split(":", 1)
-        else:
-            password = auth
-        # pisah host:port
-        if ":" in hostport:
-            host, port = hostport.rsplit(":", 1)
-            port = int(port)
-        else:
-            host, port = hostport, 6379
-        return host, port, password
-    except Exception as e:
-        print(f"[REDIS] Parse URL error: {e}")
-        return None, None, None
+def jb_headers():
+    return {
+        "X-Master-Key": JSONBIN_API_KEY,
+        "Content-Type": "application/json"
+    }
 
-def redis_cmd(*args):
-    """Kirim command ke Redis via raw TCP socket — tidak butuh library."""
-    if not REDIS_URL:
-        return None
-    host, port, password = parse_redis_url(REDIS_URL)
-    if not host:
+def jb_get():
+    """Ambil data dari JSONBin."""
+    if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
         return None
     try:
-        import socket
-        use_ssl = REDIS_URL.startswith("rediss://")
-        s = socket.create_connection((host, port), timeout=10)
-        if use_ssl:
-            import ssl
-            ctx = ssl.create_default_context()
-            s = ctx.wrap_socket(s, server_hostname=host)
-
-        def send(cmd_parts):
-            cmd = f"*{len(cmd_parts)}\r\n"
-            for p in cmd_parts:
-                p = str(p)
-                cmd += f"${len(p.encode())}\r\n{p}\r\n"
-            s.sendall(cmd.encode())
-
-        def recv():
-            buf = b""
-            while not buf.endswith(b"\r\n"):
-                buf += s.recv(4096)
-            return buf.decode()
-
-        # Auth jika ada password
-        if password:
-            send(["AUTH", password])
-            resp = recv()
-            if "ERR" in resp or "WRONGPASS" in resp:
-                print(f"[REDIS] Auth error: {resp.strip()}")
-                s.close()
-                return None
-
-        # Jalankan command
-        send(list(args))
-
-        # Baca response
-        buf = b""
-        while True:
-            chunk = s.recv(65536)
-            buf += chunk
-            if buf.endswith(b"\r\n"):
-                break
-
-        s.close()
-        resp = buf.decode()
-
-        # Parse response
-        if resp.startswith("+"):
-            return resp[1:].strip()
-        elif resp.startswith("-"):
-            print(f"[REDIS] Error: {resp.strip()}")
-            return None
-        elif resp.startswith("$"):
-            lines = resp.split("\r\n")
-            size = int(lines[0][1:])
-            if size == -1:
-                return None
-            return lines[1]
-        elif resp.startswith(":"):
-            return int(resp[1:].strip())
-        return resp.strip()
+        r = requests.get(JSONBIN_URL + "/latest", headers=jb_headers(), timeout=10)
+        if r.status_code == 200:
+            return r.json().get("record", {})
+        return None
     except Exception as e:
-        print(f"[REDIS] Command error: {e}")
+        print(f"[JSONBIN] GET error: {e}")
         return None
 
-def kv_set(key, value):
-    result = redis_cmd("SET", key, value)
-    return result == "OK"
-
-def kv_get(key):
-    return redis_cmd("GET", key)
-
-def kv_ping():
-    return redis_cmd("PING") == "PONG"
+def jb_put(data: dict):
+    """Update data di JSONBin."""
+    if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
+        return False
+    try:
+        r = requests.put(JSONBIN_URL, headers=jb_headers(), json=data, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"[JSONBIN] PUT error: {e}")
+        return False
 
 # ─────────────────────────────────────────────────────────────
 # Auth
@@ -157,11 +82,11 @@ def save_token():
         "saved_at": datetime.now(timezone.utc).isoformat()
     }
 
-    ok = kv_set(TOKEN_KEY, json.dumps(payload))
+    ok = jb_put(payload)
     if ok:
         return jsonify({"ok": True, "saved_at": payload["saved_at"]})
     else:
-        return jsonify({"ok": False, "error": "Gagal simpan ke Redis"}), 500
+        return jsonify({"ok": False, "error": "Gagal simpan ke JSONBin"}), 500
 
 
 @app.route("/api/get-token", methods=["GET"])
@@ -169,63 +94,42 @@ def get_token():
     if not auth_ok():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-    raw = kv_get(TOKEN_KEY)
-    if not raw:
+    data = jb_get()
+    if not data or not data.get("token"):
         return jsonify({"ok": False, "error": "Token belum ada. Login OAuth dulu di Koyeb."}), 404
 
-    try:
-        payload = json.loads(raw) if isinstance(raw, str) else raw
-        return jsonify({
-            "ok": True,
-            "token": payload.get("token"),
-            "saved_at": payload.get("saved_at")
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Token corrupt: {e}"}), 500
+    return jsonify({
+        "ok": True,
+        "token": data.get("token"),
+        "saved_at": data.get("saved_at")
+    })
 
 
 @app.route("/api/status", methods=["GET"])
 def status():
-    raw = kv_get(TOKEN_KEY)
-    if not raw:
+    data = jb_get()
+    if not data or not data.get("token"):
         return jsonify({"token_exists": False, "saved_at": None})
-    try:
-        payload = json.loads(raw) if isinstance(raw, str) else raw
-        return jsonify({"token_exists": True, "saved_at": payload.get("saved_at")})
-    except Exception:
-        return jsonify({"token_exists": False, "saved_at": None})
+    return jsonify({"token_exists": True, "saved_at": data.get("saved_at")})
 
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    redis_ok = False
-    error_msg = None
-    try:
-        redis_ok = kv_ping()
-    except Exception as e:
-        error_msg = str(e)
+    bin_ok = bool(JSONBIN_BIN_ID and JSONBIN_API_KEY)
     return jsonify({
         "ok": True,
-        "redis_connected": redis_ok,
-        "redis_url_set": bool(REDIS_URL),
+        "storage": "jsonbin.io",
+        "jsonbin_configured": bin_ok,
         "secret_configured": bool(SECRET),
-        "error": error_msg,
         "time": datetime.now(timezone.utc).isoformat()
     })
 
 
 @app.route("/")
 def index():
-    raw = kv_get(TOKEN_KEY)
-    token_exists = False
-    saved_at = "-"
-    if raw:
-        try:
-            payload = json.loads(raw) if isinstance(raw, str) else raw
-            token_exists = True
-            saved_at = payload.get("saved_at", "-")
-        except Exception:
-            pass
+    data = jb_get()
+    token_exists = bool(data and data.get("token"))
+    saved_at = data.get("saved_at", "-") if data else "-"
 
     status_color = "#4ade80" if token_exists else "#f87171"
     status_text  = "✅ Token tersimpan" if token_exists else "❌ Belum ada token"
@@ -257,7 +161,7 @@ def index():
 <body>
 <div class="card">
   <h1>🔐 YT Token Store</h1>
-  <p class="sub">Token disimpan di Redis — dikelola oleh Koyeb</p>
+  <p class="sub">Token disimpan di JSONBin.io — dikelola oleh Koyeb</p>
   <div class="badge">{status_text}</div>
   <div class="meta">Terakhir disimpan: {saved_at}</div>
   <div class="endpoints">
