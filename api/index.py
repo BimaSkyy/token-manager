@@ -1,21 +1,14 @@
 """
 YouTube Token Store — Vercel
-Fungsi: hanya simpan & ambil token. Semua logic ada di Koyeb.
+Pakai requests (built-in) untuk konek Redis Cloud via REST API.
+Tidak butuh library redis sama sekali.
 """
 
 import os
 import json
-import subprocess
-import sys
+import requests
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
-
-# Auto-install redis jika belum ada
-try:
-    import redis
-except ImportError:
-    subprocess.run([sys.executable, "-m", "pip", "install", "redis==5.0.1"], check=True)
-    import redis
 
 app = Flask(__name__)
 
@@ -24,41 +17,121 @@ SECRET    = os.environ.get("STORE_SECRET", "")
 TOKEN_KEY = "yt_token"
 
 # ─────────────────────────────────────────────────────────────
-# Redis Helpers
+# Parse REDIS_URL → host, port, password
+# Format: redis://default:PASSWORD@HOST:PORT
 # ─────────────────────────────────────────────────────────────
 
-def get_redis():
-    if not REDIS_URL: return None
+def parse_redis_url(url):
     try:
-        return redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=10)
+        # rediss:// atau redis://
+        url = url.replace("rediss://", "").replace("redis://", "")
+        # pisah auth dan host
+        if "@" in url:
+            auth, hostport = url.rsplit("@", 1)
+        else:
+            auth, hostport = "", url
+        # pisah user:pass
+        if ":" in auth:
+            _, password = auth.split(":", 1)
+        else:
+            password = auth
+        # pisah host:port
+        if ":" in hostport:
+            host, port = hostport.rsplit(":", 1)
+            port = int(port)
+        else:
+            host, port = hostport, 6379
+        return host, port, password
     except Exception as e:
-        print(f"[REDIS] Connect error: {e}")
+        print(f"[REDIS] Parse URL error: {e}")
+        return None, None, None
+
+def redis_cmd(*args):
+    """Kirim command ke Redis via raw TCP socket — tidak butuh library."""
+    if not REDIS_URL:
+        return None
+    host, port, password = parse_redis_url(REDIS_URL)
+    if not host:
+        return None
+    try:
+        import socket
+        use_ssl = REDIS_URL.startswith("rediss://")
+        s = socket.create_connection((host, port), timeout=10)
+        if use_ssl:
+            import ssl
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(s, server_hostname=host)
+
+        def send(cmd_parts):
+            cmd = f"*{len(cmd_parts)}\r\n"
+            for p in cmd_parts:
+                p = str(p)
+                cmd += f"${len(p.encode())}\r\n{p}\r\n"
+            s.sendall(cmd.encode())
+
+        def recv():
+            buf = b""
+            while not buf.endswith(b"\r\n"):
+                buf += s.recv(4096)
+            return buf.decode()
+
+        # Auth jika ada password
+        if password:
+            send(["AUTH", password])
+            resp = recv()
+            if "ERR" in resp or "WRONGPASS" in resp:
+                print(f"[REDIS] Auth error: {resp.strip()}")
+                s.close()
+                return None
+
+        # Jalankan command
+        send(list(args))
+
+        # Baca response
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            buf += chunk
+            if buf.endswith(b"\r\n"):
+                break
+
+        s.close()
+        resp = buf.decode()
+
+        # Parse response
+        if resp.startswith("+"):
+            return resp[1:].strip()
+        elif resp.startswith("-"):
+            print(f"[REDIS] Error: {resp.strip()}")
+            return None
+        elif resp.startswith("$"):
+            lines = resp.split("\r\n")
+            size = int(lines[0][1:])
+            if size == -1:
+                return None
+            return lines[1]
+        elif resp.startswith(":"):
+            return int(resp[1:].strip())
+        return resp.strip()
+    except Exception as e:
+        print(f"[REDIS] Command error: {e}")
         return None
 
-def kv_set(key: str, value: str) -> bool:
-    r = get_redis()
-    if not r: return False
-    try:
-        r.set(key, value)
-        return True
-    except Exception as e:
-        print(f"[REDIS SET] error: {e}")
-        return False
+def kv_set(key, value):
+    result = redis_cmd("SET", key, value)
+    return result == "OK"
 
-def kv_get(key: str):
-    r = get_redis()
-    if not r: return None
-    try:
-        return r.get(key)
-    except Exception as e:
-        print(f"[REDIS GET] error: {e}")
-        return None
+def kv_get(key):
+    return redis_cmd("GET", key)
+
+def kv_ping():
+    return redis_cmd("PING") == "PONG"
 
 # ─────────────────────────────────────────────────────────────
 # Auth
 # ─────────────────────────────────────────────────────────────
 
-def auth_ok() -> bool:
+def auth_ok():
     provided = (
         request.headers.get("X-Store-Secret") or
         request.args.get("secret")
@@ -128,10 +201,7 @@ def health():
     redis_ok = False
     error_msg = None
     try:
-        r = get_redis()
-        if r:
-            r.ping()
-            redis_ok = True
+        redis_ok = kv_ping()
     except Exception as e:
         error_msg = str(e)
     return jsonify({
